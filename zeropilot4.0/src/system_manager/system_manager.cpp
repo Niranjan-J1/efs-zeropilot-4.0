@@ -4,6 +4,12 @@
 #define SM_TELEMETRY_HEARTBEAT_RATE_HZ 1
 #define SM_TELEMETRY_RC_DATA_RATE_HZ 5
 
+#define BATTERY_LOW_VOLTAGE      10.5f
+#define BATTERY_CRITICAL_VOLTAGE 9.8f
+
+#define BATTERY_LOW_TIME_MS      10000
+#define BATTERY_CRITICAL_TIME_MS 3000
+
 SystemManager::SystemManager(
     ISystemUtils *systemUtilsDriver,
     IIndependentWatchdog *iwdgDriver,
@@ -21,11 +27,21 @@ SystemManager::SystemManager(
         amRCQueue(amRCQueue),
         tmQueue(tmQueue),
         smLoggerQueue(smLoggerQueue),
-        smSchedulingCounter(0) {}
+        smSchedulingCounter(0),
+        batteryLow(false),
+        batteryCritical(false),
+        batteryLowLogged(false),
+        batteryCritLogged(false),
+        batteryVoltage(0.0),
+        batteryCurrent(0.0),
+        batteryDataValid(false),
+        batteryLowCounterMs(0),
+        batteryCritcounterMs(0){}
 
 void SystemManager::smUpdate() {
     // Kick the watchdog
     iwdgDriver->refreshWatchdog();
+
 
     // Get RC data from the RC receiver and passthrough to AM if new
     static int oldDataCount = 0;
@@ -75,12 +91,60 @@ void SystemManager::smUpdate() {
     if (smSchedulingCounter % (SM_SCHEDULING_RATE_HZ / SM_TELEMETRY_HEARTBEAT_RATE_HZ) == 0) {
         sendHeartbeatDataToTelemetryManager(baseMode, customMode, systemStatus);
     }
-
+    //Validate pmDriver data and then instantiate voltage and current 
     if (pmDriver) {
 		PMData_t pmData;
 		bool pmDataValid = pmDriver->readData(&pmData);
-		(void)pmDataValid; // TODO: remove when used, this line is to suppress -Wunused-variable
+
+        if(pmDataValid){
+            batteryVoltage =  pmData.busVoltage;
+            batteryCurrent = pmData.current;
+            batteryDataValid = true;
+        }
+        else{
+            batteryDataValid = false;
+        }
 	}
+
+    if (batteryDataValid) {
+        //Low battery detection 
+        if (batteryVoltage < BATTERY_LOW_VOLTAGE) {
+            batteryLowCounterMs += SM_CONTROL_LOOP_DELAY;
+            if (batteryLowCounterMs >= BATTERY_LOW_TIME_MS) {
+                batteryLow = true;
+            }
+        } else {
+            batteryLowCounterMs = 0;
+            batteryLow = false;
+            batteryLowLogged = false; 
+        }
+
+        //Crtitical battery detection
+        if (batteryVoltage < BATTERY_CRITICAL_VOLTAGE) {
+            batteryCritcounterMs += SM_CONTROL_LOOP_DELAY;
+            if (batteryCritcounterMs >= BATTERY_CRITICAL_TIME_MS) {
+                batteryCritical = true;
+            }
+        } else {
+            batteryCritcounterMs = 0;
+            batteryCritical = false;
+            batteryCritLogged = false;
+        }
+    }
+
+
+    //Logging --> once per transition, checks if the state has yet to be logged and does so 
+    if(batteryLow &&!batteryLowLogged){
+        loggerDriver->log("Battery low");
+        //TO DO: Send battery data to tm
+        batteryLowLogged = true;
+    }
+
+    if(batteryCritical && !batteryCritLogged){
+        loggerDriver->log("Battery critical");
+        //TO DO: Send battery data to tm
+        batteryCritLogged = true;
+    }
 
     // Log if new messages
     if (smLoggerQueue->count() > 0) {
@@ -113,6 +177,7 @@ void SystemManager::sendRCDataToAttitudeManager(const RCControl &rcData) {
 
     amRCQueue->push(&rcDataMessage);
 }
+
 
 void SystemManager::sendMessagesToLogger() {
     static char messages[16][100];
